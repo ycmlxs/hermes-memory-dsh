@@ -1,0 +1,5 @@
+node_modules/
+.hermes-memory/
+hermes-selfcheck.json
+*.log
+.DS_Store
