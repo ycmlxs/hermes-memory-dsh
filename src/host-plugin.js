@@ -195,8 +195,8 @@ function standingBlock(cache) {
 return {
   // 硬依赖：作为 DSH 常驻插件（root/cordis.yml 层）加载时，须在这些服务就绪后 apply
   // 才会执行；否则 apply 过早运行且 ctx.get 返回 undefined。
-  inject: ['fs', 'sandboxPolicy', 'agents', 'commands', 'systemPrompt', 'sessionQuery', 'tools'],
-  apply(ctx) {
+  inject: ['fs', 'sandboxPolicy', 'agents', 'commands', 'systemPrompt', 'sessionQuery', 'tools', 'webServer'],
+  async apply(ctx) {
     const fs = ctx.get('fs');
     const sandboxPolicy = ctx.get('sandboxPolicy');
     const agents = ctx.get('agents');
@@ -205,6 +205,7 @@ return {
     const sessionQuerySvc = ctx.get('sessionQuery');
     const harnessGlobal = typeof harness !== 'undefined' ? harness : undefined;
     const toolsRuntime = ctx.get('tools');
+    const webServer = ctx.get('webServer');
 
     const fallbackBase = sandboxPolicy && typeof sandboxPolicy.workspaceRoot === 'string'
       ? sandboxPolicy.workspaceRoot.replace(/\/$/, '') : null;
@@ -228,6 +229,29 @@ return {
         return !!session ? sandboxPolicy.resolve({ session }) : sandboxPolicy.resolve();
       } catch (e) { return undefined; }
     };
+
+    // ── 插件配置（记忆根下 config.json，设置栏可改，持久化，所有会话生效）──
+    const DEFAULT_CFG = { autoEvict: true, correctionDetect: true, standingEnabled: true };
+    let cfg = Object.assign({}, DEFAULT_CFG);
+    const CONFIG_FILE = fallbackBase + '/.hermes-memory/config.json';
+    const loadConfig = async () => {
+      try {
+        const t = await fs.resolve(CONFIG_FILE);
+        const info = await fs.stat(t);
+        if (!info) return;
+        const raw = await fs.readText(t);
+        const p = JSON.parse(raw || '{}');
+        if (p && typeof p === 'object') cfg = Object.assign({}, DEFAULT_CFG, p);
+      } catch (e) { /* 保持默认 */ }
+    };
+    const saveConfig = async (patch) => {
+      cfg = Object.assign({}, cfg, patch);
+      try {
+        const t = await fs.resolve(CONFIG_FILE);
+        await fs.writeText(t, JSON.stringify(cfg, null, 2), undefined, undefined, policyFor(null));
+      } catch (e) { console.error('[hermes-memory] 保存配置失败: ' + (e && e.message ? e.message : String(e))); }
+    };
+    await loadConfig();
 
     let standingCache = { cwd: null, text: '' };
     const standingPath = (cwd) => (cwd || fallbackBase) + '/.hermes-memory/' + STANDING_FILE;
@@ -307,6 +331,9 @@ return {
       const next0 = entries.concat([{ text, created: nowIso(), last: nowIso(), category }]);
       let { chars } = usageOf(next0, TARGET_LIMITS[target]);
       if (chars > TARGET_LIMITS[target]) {
+        if (cfg.autoEvict === false) {
+          return { success: false, error: '记忆已满 ' + chars + '/' + TARGET_LIMITS[target] + ' 字符（自动整合已关闭）。请 replace/remove 或手动整理文件。', usage: { chars, limit: TARGET_LIMITS[target] } };
+        }
         const { next, evicted: evList, chars: afterChars } = evictOldest(entries, TARGET_LIMITS[target], text);
         if (afterChars > TARGET_LIMITS[target]) {
           return { success: false, error: '记忆已满且无法自动整合（单条即超限）。请拆分或精简内容。', usage: { chars: afterChars, limit: TARGET_LIMITS[target] } };
@@ -355,6 +382,7 @@ return {
     const correctionSeen = new Set();
     if (ctx.on) {
       ctx.effect(() => ctx.on('session/event', (session, ev) => {
+        if (cfg.correctionDetect === false) return;
         let cwd = null;
         try { cwd = session && session.header ? (session.header.cwd || null) : null; } catch (e) { cwd = null; }
         if (typeof cwd !== 'string' || !cwd) return;
@@ -549,13 +577,65 @@ return {
       }), 'hermes-memory:memory-pin');
     }
 
+    // ── 设置栏数据桥：status（GET）/ config（POST）JSON API ──
+    if (webServer && typeof webServer.register === 'function') {
+      const readJsonBody = (req) => new Promise((resolve, reject) => {
+        const chunks = [];
+        req.on('data', (c) => { chunks.push(c); if (chunks.length > 5e6) req.destroy(new Error('body too large')); });
+        req.on('end', () => {
+          try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}); }
+          catch (e) { reject(new Error('invalid json body')); }
+        });
+        req.on('error', reject);
+      });
+      const sendJson = (res, code, obj) => {
+        res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(obj));
+      };
+      const statusPayload = async () => {
+        const memDir = fallbackBase + '/.hermes-memory';
+        const targets = {};
+        for (const tg of TARGET_ENUM) {
+          const entries = await readEntries(memDir, tg);
+          const u = usageOf(entries, TARGET_LIMITS[tg]);
+          targets[tg] = { entries: entries.length, chars: u.chars, limit: u.limit };
+        }
+        return { plugin: 'hermes-memory-dsh', memoryRoot: memDir, config: cfg, targets };
+      };
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/plugins/hermes-memory-dsh/status',
+        handler: async (req, res) => {
+          try { sendJson(res, 200, await statusPayload()); }
+          catch (e) { sendJson(res, 500, { error: e && e.message ? e.message : String(e) }); }
+        },
+      }), 'hermes-memory:status-route');
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/plugins/hermes-memory-dsh/config',
+        handler: async (req, res) => {
+          try {
+            if (req.method === 'POST' || req.method === 'PUT') {
+              const patch = await readJsonBody(req);
+              const allowed = {};
+              for (const key of ['autoEvict', 'correctionDetect', 'standingEnabled']) {
+                if (typeof patch[key] === 'boolean') allowed[key] = patch[key];
+              }
+              if (Object.keys(allowed).length) await saveConfig(allowed);
+            }
+            sendJson(res, 200, cfg);
+          } catch (e) { sendJson(res, 400, { error: e && e.message ? e.message : String(e) }); }
+        },
+      }), 'hermes-memory:config-route');
+    }
+
     // ── 系统提示注入 ──
     if (systemPrompt && typeof systemPrompt.section === 'function') {
       ctx.effect(() => systemPrompt.section({ name: 'hermes-memory:policy', order: 45, text: POLICY_TEXT }), 'hermes-memory:policy');
       ctx.effect(() => systemPrompt.section({
         name: 'hermes-memory:standing',
         order: 46,
-        text: () => standingBlock(standingCache),
+        text: () => (cfg.standingEnabled === false ? '' : standingBlock(standingCache)),
       }), 'hermes-memory:standing');
     }
 
