@@ -5,9 +5,11 @@
 - **持久记忆** — `memory/user/failure/project` 多目标，`§` 分隔 + 老化元数据，落盘为可读 Markdown
 - **schema-safe 工具** — `memory_add` / `memory_replace` / `memory_remove` / `memory_search`
 - **安全扫描** — 密钥、注入、不可见 Unicode 写入拦截（`content-scanner`）
-- **常驻指令** — `STANDING.md` 每次会话注入 + `/memory-pin` 管理
+- **自动整合** — 写满时自动按老化逐出最旧条目，绝不静默丢新增
+- **纠错检测** — 监听会话事件，把用户纠正自动保存为 failure/correction
+- **常驻指令** — `STANDING.md` 每次会话注入 + `/memory-pin` 管理 + `/memory-preview` 预览
 - **策略注入** — `policy-only` 系统提示（省 token）
-- **会话检索** — `session_search` 复用 DSH `sessionQuery`（部署禁用索引时明确报错）
+- **会话检索** — `session_search` 复用 DSH `sessionQuery`（部署已配置 `first-search` 索引，重启后可用）
 
 ## 文件结构
 
@@ -38,6 +40,7 @@ hermes-memory-dsh/
 | 工具 | `memory_search` | 关键词（多词 AND）/类别过滤检索 |
 | 工具 | `session_search` | 复用 DSH 会话索引全文检索 |
 | 命令 | `/memory-insights` | 各目标条目数与容量 |
+| 命令 | `/memory-preview` | 预览注入的 memory-policy 与 STANDING 块 |
 | 命令 | `/memory-pin <规则>` | 常驻指令管理（`list` / `remove <n>` / `clear`） |
 | 提示 | `<hermes-memory-policy>` | 引导模型何时调用记忆工具 |
 | 提示 | `<hermes-standing-instructions>` | STANDING.md 常驻注入 |
@@ -66,9 +69,22 @@ hermes-memory-dsh/
 
 ## 已知限制
 
-- **`session_search` 依赖部署启用的 DSH 会话索引**（`session-query openAt`）。未启用时工具明确报错；可在部署开启索引，或为其增加「直接扫描会话 JSONL」的回退实现。
-- **动态插件为 process-local**：进程重启后需重新激活；数据文件持久保留。如需长期可用，可固化为 DSH 常驻插件或 agent preset。
-- 背景学习环路、纠错检测、自动整合等**不在本期范围**（上游 `pi-hermes-memory` 完整能力清单见其仓库）。
+- **`session_search` 需要重启使会话索引生效**：已在部署 `cordis.patch.yml` 将 `session-query-sqlite` 改为 `openAt: first-search` + 持久磁盘路径；**重启 DSH 后**可用。未重启前工具仍报索引禁用。
+- **动态插件为 process-local**：进程重启后需重新激活；数据文件持久保留。本仓库同时提供**固化路径**（见下）。
+- 背景学习环路等上游能力仍不在本期范围。
+
+## 固化长期可用（DSH 常驻插件）
+
+仓库同步维护一份可直接作为常驻插件的源码；部署步骤：
+
+1. 把 `src/host-plugin.js` 顶层 `return {` 改为 `export default {` 生成 ESM `index.js`（本部署已生成于 `~/.dsh/plugins/hermes-memory-dsh/index.js`）。
+2. 在 profile 的 `cordis.patch.yml` 追加：
+   ```yaml
+   - insert:
+       - id: hermes-memory
+         name: '/home/ycqmlxs/.dsh/plugins/hermes-memory-dsh/index.js'
+   ```
+3. 重启 DSH 后插件每个会话自动加载（当前部署已按此配置）。
 
 ## 技术要点（移植踩坑）
 
