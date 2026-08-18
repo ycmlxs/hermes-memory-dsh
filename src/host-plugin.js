@@ -10,7 +10,7 @@
  *  - session_search：复用 DSH sessionQuery（部署若禁用索引则明确报错）
  *  - /memory-insights、/memory-pin 两个命令
  *  - memory-policy 与 STANDING 常驻指令的系统提示注入
- *  - 启动自检：真实落盘增删查演练并清理
+ *  - 启动时静默加载 STANDING 缓存（无误报日志/演练）
  *
  * 用法：在 DSH Cordis 环境中作为动态插件 Host 半数注册（cordis_define + cordis_run）。
  * 数据落盘：{会话工作区}/.hermes-memory/{MEMORY,USER,FAILURES,PROJECT,STANDING}.md
@@ -639,99 +639,13 @@ return {
       }), 'hermes-memory:standing');
     }
 
-    // ── 加载 STANDING 缓存 + 启动自检（真实落盘演练并在磁盘留痕，随后清理）──
+    // ── 加载 STANDING 缓存（供系统提示注入；不做磁盘演练/日志输出）──
     (async () => {
       let initiator = null;
       try {
         if (agents && typeof agents.currentInitiator === 'function') initiator = agents.currentInitiator();
       } catch (e) { initiator = null; }
       await readStanding(initiator);
-
-      const cwd = headerCwd(initiator) || fallbackBase;
-      const selfMemDir = cwd + '/.hermes-memory';
-      const report = { root: selfMemDir, cwd, ts: nowIso() };
-      const writeReport = async () => {
-        const payload = JSON.stringify(report, null, 2);
-        const targets = ['/tmp/hermes-selfcheck.json', cwd + '/hermes-selfcheck.json'];
-        for (const p of targets) {
-          try {
-            const t = await fs.resolve(p);
-            await fs.writeText(t, payload, undefined, undefined, policyFor(initiator));
-            report.file = p;
-            return;
-          } catch (e) { report.tryFileError = (report.tryFileError || []).concat([p + ' → ' + (e && e.message ? e.message : String(e))]); }
-        }
-      };
-
-      try {
-        report.services = {
-          fs: !!fs, sandboxPolicy: !!sandboxPolicy, commands: !!commands, agents: !!agents,
-          systemPrompt: !!systemPrompt, sessionQuery: !!sessionQuerySvc, harness: !!harnessGlobal,
-        };
-        report.initiatorCwd = headerCwd(initiator);
-        report.scan = {
-          blocksSecret: scanContent('export const KEY = sk-ant-api03-1234567890abcdef') !== null,
-          allowsPlain: scanContent('用户偏好 pnpm 而非 npm') === null,
-        };
-        const rt = parseFile(renderFile([{ text: 'a', created: 'c', last: 'l', category: 'preference' }]));
-        report.roundtrip = rt.length === 1 && rt[0].text === 'a' && rt[0].category === 'preference';
-
-        const pos = ['No, use pnpm instead', 'please remember to use pnpm', 'I said we should use yarn'];
-        const neg = ['No worries, it looks great', 'actually looks great', 'ok that looks fine'];
-        report.correctionDetector = {
-          positiveOk: pos.every((s) => matchCorrection(s)),
-          negativeOk: neg.every((s) => !matchCorrection(s)),
-        };
-        const ev = evictOldest(
-          [{ text: 'oldest', created: '2020-01-01' }, { text: 'old2', created: '2023-01-01' }, { text: 'recent', created: '2026-01-01' }],
-          20, 'BRAND_NEW',
-        );
-        report.evictOk = ev.evicted.length >= 1 && ev.chars <= 20 && ev.next.every((e) => e.text !== 'oldest');
-
-        const before = await readEntries(selfMemDir, 'project');
-        const add = await doAdd(initiator, selfMemDir, 'project', '__hermes_selftest__', undefined);
-        report.add = add;
-        report.addOk = !!(add && add.success);
-        if (report.addOk) {
-          const found = await doSearch(selfMemDir, '__hermes_selftest__', 'project', undefined, 5);
-          report.searchOk = found.length === 1;
-          const rm = await doRemove(initiator, selfMemDir, 'project', '__hermes_selftest__');
-          report.removeOk = !!(rm && rm.success);
-          const after = await readEntries(selfMemDir, 'project');
-          report.cleanRestored = JSON.stringify(after) === JSON.stringify(before);
-        }
-
-        // STANDING 注入端到端：备份→写→读回→恢复
-        try {
-          const orig = standingCache.text;
-          const testTxt = '__hermes_standing_selftest__';
-          await writeStanding(initiator, testTxt);
-          const readBack = await readStanding(initiator);
-          report.standingRoundtrip = readBack === testTxt;
-          report.standingBlockWellFormed = standingBlock(standingCache).includes('<hermes-standing-instructions>');
-          await writeStanding(initiator, orig);
-          report.standingRestored = (await readStanding(initiator)) === orig;
-        } catch (e) {
-          report.standingError = e && e.message ? e.message : String(e);
-        }
-
-        // session_query 真实调用探针（复用 DSH 会话索引）
-        try {
-          const qpage = await sessionQuerySvc.searchSessions({ query: 'memory', limit: 3 });
-          const hits = qpage && qpage.items ? qpage.items : [];
-          report.sessionSearch = { ok: true, count: hits.length };
-          if (hits[0] && hits[0].bestMatch) {
-            report.sessionSearch.sample = hits[0].bestMatch.snippet ? hits[0].bestMatch.snippet.slice(0, 100) : null;
-            report.sessionSearch.sessionId = hits[0].header && hits[0].header.id ? hits[0].header.id : null;
-          }
-        } catch (e) {
-          report.sessionSearch = { ok: false, error: e && e.message ? e.message : String(e) };
-        }
-      } catch (e) {
-        report.error = e && e.message ? e.message : String(e);
-      }
-      console.log('[hermes-memory] 自检: ' + JSON.stringify(report));
-      await writeReport();
     })();
   },
 };
