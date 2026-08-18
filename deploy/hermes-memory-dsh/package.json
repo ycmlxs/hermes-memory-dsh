@@ -1,0 +1,23 @@
+{
+  "name": "hermes-memory-dsh",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "pi-hermes-memory core memory loop ported to DSH: host plugin + web settings page.",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  }
+}
