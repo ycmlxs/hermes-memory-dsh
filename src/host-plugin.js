@@ -193,6 +193,9 @@ function standingBlock(cache) {
 
 // ── 插件主体 ──
 return {
+  // 硬依赖：作为 DSH 常驻插件（root/cordis.yml 层）加载时，须在这些服务就绪后 apply
+  // 才会执行；否则 apply 过早运行且 ctx.get 返回 undefined。
+  inject: ['fs', 'sandboxPolicy', 'agents', 'commands', 'systemPrompt', 'sessionQuery'],
   apply(ctx) {
     const fs = ctx.get('fs');
     const sandboxPolicy = ctx.get('sandboxPolicy');
