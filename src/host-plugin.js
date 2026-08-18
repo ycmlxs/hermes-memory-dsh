@@ -195,7 +195,7 @@ function standingBlock(cache) {
 return {
   // 硬依赖：作为 DSH 常驻插件（root/cordis.yml 层）加载时，须在这些服务就绪后 apply
   // 才会执行；否则 apply 过早运行且 ctx.get 返回 undefined。
-  inject: ['fs', 'sandboxPolicy', 'agents', 'commands', 'systemPrompt', 'sessionQuery'],
+  inject: ['fs', 'sandboxPolicy', 'agents', 'commands', 'systemPrompt', 'sessionQuery', 'tools'],
   apply(ctx) {
     const fs = ctx.get('fs');
     const sandboxPolicy = ctx.get('sandboxPolicy');
@@ -204,6 +204,7 @@ return {
     const systemPrompt = ctx.get('systemPrompt');
     const sessionQuerySvc = ctx.get('sessionQuery');
     const harnessGlobal = typeof harness !== 'undefined' ? harness : undefined;
+    const toolsRuntime = ctx.get('tools');
 
     const fallbackBase = sandboxPolicy && typeof sandboxPolicy.workspaceRoot === 'string'
       ? sandboxPolicy.workspaceRoot.replace(/\/$/, '') : null;
@@ -375,21 +376,46 @@ return {
       }), 'hermes-memory:correction-detector');
     }
 
-    // ── 工具注册辅助 ──
-    const registerTool = (name, description, parameters, execute) => {
-      if (!harnessGlobal) return;
-      const tool = harnessGlobal.defineTool({
-        name,
-        description,
-        parameters,
-        output: {
-          schema: { type: 'json' },
-          render: (args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
-        },
-        execute: async (args, exec) => sanitizeJson(await execute(args, exec)),
-      });
-      const dispose = harnessGlobal.registerTool(ctx, tool);
-      ctx.effect(() => dispose, 'hermes-memory:' + name);
+    // ── 工具注册辅助：优先 harness（动态插件场景），否则标准 ctx.tools（常驻插件场景）──
+    const registerTool = (name, description, parametersDsl, execute) => {
+      const wrapExecute = async (args, exec) => sanitizeJson(await execute(args, exec));
+      const sharedOutput = {
+        schema: { type: 'object', properties: {}, additionalProperties: true },
+        render: (args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+      };
+      // 动态插件场景：harness.defineTool（parameters 用 DSL）
+      if (harnessGlobal && typeof harnessGlobal.defineTool === 'function') {
+        const tool = harnessGlobal.defineTool({
+          name,
+          description,
+          parameters: parametersDsl,
+          output: { schema: { type: 'json' }, render: sharedOutput.render },
+          execute: wrapExecute,
+        });
+        const dispose = harnessGlobal.registerTool(ctx, tool);
+        ctx.effect(() => dispose, 'hermes-memory:' + name);
+        return;
+      }
+      // 常驻插件场景：标准 tools.register（parameters 用 JSON Schema）
+      if (toolsRuntime && typeof toolsRuntime.register === 'function') {
+        const properties = {};
+        const required = [];
+        for (const key of Object.keys(parametersDsl)) {
+          const prop = Object.assign({}, parametersDsl[key]);
+          if (prop.required === true) required.push(key);
+          delete prop.required;
+          properties[key] = prop;
+        }
+        const def = {
+          name,
+          description,
+          parameters: { type: 'object', properties, required, additionalProperties: true },
+          output: sharedOutput,
+          execute: wrapExecute,
+        };
+        const dispose = toolsRuntime.register(def);
+        ctx.effect(() => dispose, 'hermes-memory:' + name);
+      }
     };
 
     const targetParam = (required) => {
